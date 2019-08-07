@@ -1,6 +1,7 @@
 # Apprentissage statistique
 
-Ce projet est un mini challenge d'apprentissage statistique. Il a été réalisé dans le cadre de ma seconde année de master de bioinformatique.
+Ce projet est un mini challenge d'apprentissage statistique. Il a été réalisé dans le cadre de ma seconde année de master de bioinformatique.<br>
+Ce projet a été en binôme avec Christelle Viguier.
 
 ## Données
 
