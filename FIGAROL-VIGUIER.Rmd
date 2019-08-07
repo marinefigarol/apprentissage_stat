@@ -1,0 +1,1428 @@
+---
+title: "R Notebook"
+output:
+  html_document: default
+  html_notebook: default
+---
+
+```{r setup, include=TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+options(encoding = "UTF-8")
+```
+
+
+############################################
+                 Donnees
+############################################
+
+Importation des donnees :
+```{r}
+xtrain <- as.data.frame(t(read.table("xtrain.txt", row.names = 1)))
+ytrain <- read.table("ytrain.txt", col.names = "label")
+test <- as.data.frame(t(read.table("xtest.txt", row.names = 1)))
+```
+La variable reponse (contenue dans ytrain) est associee a la colonne nommee label.
+
+Concatenation des donnees d'entrainement et des labels associes :
+```{r}
+train <- cbind(xtrain, ytrain)
+```
+
+
+############################################
+          Analyse descriptive
+############################################
+
+Dimension des donnees :
+```{r}
+cat("Dimensions des donnees des d'entrainements :\n")
+dim(train)
+cat("\nDimensions des donnees test :\n")
+dim(ytrain)
+
+# On affiche la liste totale des covariables (en commentaire parce que c'est long)
+#cat("\nTypes des variables :\n")
+#str(train, list.len = ncol(train))
+```
+
+On a 4654 covariables (qui sont toutes codees comme des variables continues) et 184 individus. La variable reponse correspond a la 4655e colonne et est codee comme une variable continue alors qu'il s'agit d'une variable de type facteur. Il faudra donc la transformer en type facteur pour l'implementation des methodes de prediction (apres l'analyse descriptive).
+On remarque que l'on a tres peu d'individus par rapport au nombre de covariables. On est donc dans un contexte de grande dimension. On va donc devoir selectionner des covariables pour pouvoir implementer certaines methodes (notamment la regression logistique). De plus, lorsque l'on a trop de covariables, il est difficile de detecter du signal au milieu du bruit : il va donc etre difficile de distinguer les covariables tres liees a la variable reponse ou entre-elles de celles qui le sont moins. 
+
+
+On commence par rechercher quelle est les covariables les plus correlees a la variable reponse (situee colonne 4655) sur la matrice de correlation :
+```{r}
+#Matrice de correlation
+cormat<-cor(train)
+
+#heatmap(abs(cor(train)))       # On le fait une seule fois parce que long...
+
+#On regarde quelle est la valeur max de correlation pour une variable avec la variable reponse
+cat("Max de correlation observe entre une covariable et la variable reponse :\n")
+max(abs(cormat[4655,-4655]))
+
+#On cherche la ou les covariable(s) qui atteignent cette valeur max
+max.cor <- which.max(abs(cormat[4655,-4655]))
+cat("\nCovariable associee et son numero de colonne :\n")
+max.cor
+
+# Juste pour verifier
+#cormat[4655,2528]
+#colnames(train)[2528]
+
+# Deuxieme covariable la plus correlee a la varibale reponse
+max2.cor <- which.max(abs(cormat[4655,c(-4655,-2528)]))
+cat("\nDeuxieme covariable la plus correlee a la variable reponse :\n")
+max2.cor
+cat("\n Correlation associee :\n")
+cormat[4655, max2.cor[1]]
+```
+
+
+On trace quelques histogrammes pour voir la repartition des covariables (notamment les 2 plus correlees a la reponse) :
+```{r}
+par(mfrow = c(1,3))
+hist(train$x10006_at, main = "Histogramme 1ere covariable", col = "#66CCFF")
+hist(train$x54732_at, main = "Histogramme covariable la plus correlee a Y", col = "#66CCFF")
+hist(train$x55596_at, main = "Histogramme 2e covariable la plus correlee a Y", col = "#66CCFF")
+```
+Ces covariables semblent avoir des distributions gaussiennes.
+
+
+On trace les graphes pairs a pairs pour les premieres covariables :
+```{r}
+pairs(train[,c(1:10)])
+```
+
+Les 10 premieres covariables ne semblent pas etre specialement correlees.
+
+
+=> On ne peut pas dire grand chose au niveau des covariables car il y en a beaucoup trop pour toutes les analyser une a une. Certaines semblent correlees entre-elles lorsque l'on regarde la heatmap (quelques zones jaunes), mais il est difficile de determiner lesquelles et de les mettre a part afin de ne pas fausser l'analyse. D'autres covariables sont legerement correlees a la reponse. Le maximun de correlation etant a 0.32, on ne peut pas etre certains qu'il y ait une reelle correlation et que ce n'est pas du "hasard".
+
+
+On regarde la distribution de la variable reponse :
+```{r}
+table(train$label)
+
+cat("\n Pourcentage de rechute dans les donnees d'entrainement :\n")
+66/(118+66)*100
+```
+
+On sait que -1 correspond a une absence de rechute et 1 a une rechute. On a donc 118 patientes qui n'ont pas fait de rechute et 66 qui en ont fait une. On a environ 2 fois plus de patientes qui n'ont pas fait de rechute. Ce desequilibre pourrait entrainer un biais lors des analyses (prediction de trop de faux negatifs ?).
+Il faudra par ailleurs veiller lors de la separation des donnees en sous-jeu de donnees d'apprentissage et test a ce que tous les cas de rechutes ne soient pas dans un seul des sous-jeu (ou sous represente dans l'un d'eux).
+
+
+Avant de passer a l'implementation des methodes, on separe le jeu de donnees d'apprentissage (train) en un sous-jeu d'entrainement (2/3 ; appele train.app) et sous-jeu test (1/3 ; train.test) :
+```{r}
+label <- train$label
+
+set.seed(2018)
+train.test = sample(1:length(train$label), 62)      # selection aleatoire des indice des individus du sous-jeu de donnees test
+train.app = -train.test                             # on prend tous les autres pour l'apprentissage
+train.app = train[train.app,]                       # 122 obs
+train.test = train[train.test,]                     # 62 obs
+```
+
+
+On verifie la repartition des donnees dans les sous-jeux de donnees :
+```{r}
+table(train.app$label)
+table(train.test$label)
+```
+
+Repartition acceptable : on a bien une repartition 2/3 - 1/3 pour les 2 classes.
+
+
+############################################
+  Analyse sans selection de variables
+############################################
+
+------------------- LASSO -------------------
+
+On fait une selection des variables grace a la methode LASSO pour reduire le nombre de covariables :
+```{r}
+# On doit passer des matrices en parametre de la fonction glmnet
+x = model.matrix(label~., train.app)[,-4655]
+y = train.app$label
+xtest = model.matrix(label~., train.test)[,-4655]
+ytest = train.test$label
+
+# methode LASSO
+set.seed(2018)
+library(glmnet)
+res.lasso = glmnet(x,y, family = "binomial")
+print(res.lasso)
+```
+
+On utilise la fonction cv.glmnet pour determiner le parametre de regularisation lambda :
+```{r}
+set.seed(2018)
+plot(cv.glmnet(x,y, family = "binomial"))
+```
+
+On "zoom" sur la valeur du lambda min :
+```{r}
+set.seed(2018)
+cv.out = cv.glmnet(x, y, lambda = seq(0.04, 0.3, length = 100), family = "binomial")
+plot(cv.out)
+```
+
+On recupere la valeur du lambda min : 
+```{r}
+best = cv.out$lambda.min
+cat("Valeur du lambda min :\n")
+best
+```
+
+On calcule l'erreur test du modele correspondant a la valeur de lambda choisie par validation croisee :
+```{r}
+set.seed(2018)
+res.lasso = glmnet(x, y, lambda = seq(0.04, 0.3, length = 100), family = "binomial")
+pred.lasso = predict(res.lasso, s = best, newx = xtest, type = "class")
+err.lasso = mean(pred.lasso != ytest)
+cat("Erreur test :\n")
+err.lasso
+```
+
+On obtient une erreur test de 40% : il s'agit d'une valeur elevee. On comparera cette valeur a celle obtenue pour d'autres methodes lorsque ces dernieres auront ete implementees.
+
+
+On ajuste une regression LASSO au jeu de donnees complet avec la valeur choisie du parametre de regularisation (lambda min) :
+```{r}
+# Jeu de donnees complet
+X = model.matrix(label~., train)[,-4655]
+Y = train$label
+
+# regression LASSO
+set.seed(2018)
+fit.lasso = glmnet(X,Y, lambda = seq(0.04, 0.3, length = 100), family = "binomial")
+pred.lasso = predict(fit.lasso, type = "coefficients", s = best)
+
+beta = predict(fit.lasso, type = "nonzero", s = best)
+cat("Covariables selectionnees :\n")
+c(beta)
+cat("\nNb de variables selectionnees :\n")
+length(beta[,])
+```
+
+Avec le lambda min, on selectionne 23 covariables. Cela va nous permettre d'implementer les methodes qui ne sont pas capables de traiter des donnees ou le nombre de covariables est superieur au nombre d'individus (grande dimension).
+
+Chemins de regularisation :
+```{r}
+plot(fit.lasso, xvar = "lambda", main = "chemin de regularisation")
+```
+
+
+On peut egalement decider de prendre lambda de maniere a garder plus de covariables (et donc un lambda moins eleve) :
+```{r}
+beta2 = predict(fit.lasso, type = "nonzero", s = 0.06)
+cat("Covariables selectionnees :\n")
+c(beta2)
+cat("\nNb de variables selectionnees :\n")
+length(beta2[,])
+```
+
+Ainsi pour un lambda qui vaut 0.06, on selectionne 44 covariables. Toutes les covariables selectionnees pour lambda min sont de nouveau selectionnees avec cette nouvelle valeur de lambda.
+On aurait egalement pu prendre un lambda encore moins eleve pour garder encore plus de covariables. Cepdandant, ceci a ete fait pour un lambda valant 0.05 : on selectionnait alors 51 covariables mais il etait impossible d'implementer la regression logistique (seule methode ayant reellement besoin d'une selection de variables) qui ne convergeait pas.
+
+
+
+On code la variable reponse comme un facteur pour les autres methodes :
+```{r}
+train$label <- factor(unlist(train$label), labels = c("no", "yes"))
+label <- train$label
+#On re-separe les donnees de maniere identique que pour le LASSO mais avec les label codes en facteurs
+set.seed(2018)
+train.test = sample(1:length(train$label), 62)
+train.app = -train.test
+train.app = train[train.app,]          # 122 obs
+train.test = train[train.test,]            # 62 obs
+```
+
+
+------------------- Random Forest -------------------
+
+On ajuste la regression a l'aide de la methode de forets aleatoires. On cherche le couple de parametres mtry et ntree qui minimise l'erreur test. On commence par chercher le nombre d'arbres ntree qui minimise l'erreur OOB, avec mtry a sa valeur par defaut (qui vaut la racine du nombre de covaribles) :
+```{r}
+set.seed(1)
+library(randomForest)
+
+# On cherche le nombre d'arbres ntree qui minimise l'erreur OOB, avec mtry a sa valeur par defaut
+fit.rf = randomForest(label~., data = train.app, ntree = 20000)
+summary(fit.rf)
+plot(fit.rf$err.rate[, 1], type = "l", xlab = "nombre d'arbres", ylab = "erreur OOB", main = "Erreur OOB en fonction du nombre d'arbre")
+cat("\nmtry par defaut :\n")
+fit.rf$mtry
+```
+
+On voit que l'OOB se stabilise a peu pres a partir de 12000 arbres : on choisit donc cette valeur pour ntree.
+
+On cherche maintenant a optimiser le mtry. On essaye avec avec la valeur par defaut qui est 68, la moitie de cette valeur est son double (d'apres le site listen data) :
+```{r}
+set.seed(2018)
+print(randomForest(label~., data = train.app, ntree = 12000, mtry = 68))
+set.seed(2018)
+print(randomForest(label~., data = train.app, ntree = 12000, mtry = 34))
+set.seed(2018)
+print(randomForest(label~., data = train.app, ntree = 12000, mtry = 136))
+```
+
+On obtient la meme erreur OOB pour mtry = 68 et 34 ainsi que la meme matrice de confusion. On choisit donc de garder le mtry par defaut.
+
+
+Erreur test :
+```{r}
+set.seed(2018)
+fit.rf <- randomForest(label~., data = train.app, ntree = 12000, mtry = 68)
+pred = predict(fit.rf, newdata = train.test, type = "class")
+err.rf1 = mean(pred != train.test$label)
+cat("Erreur test:\n")
+err.rf1
+```
+
+
+------------------- Methode bagging : -------------------
+
+On cherche le nombre d'arbres ntree qui minimise l'erreur OOB, avec mtry = 4654 (bagging)
+```{r}
+set.seed(2018)
+fit.bag = randomForest(label~., data = train.app, mtry = 4654, ntree = 20000)
+plot(fit.bag$err.rate[, 1], type = "l", xlab = "nombre d'arbres", ylab = "erreur OOB", main = "Erreur OOB en fonction du nombre d'arbre")
+```
+
+On voit que l'OOB se stabilise a peut pres a partir de 18000 arbres : on choisit donc cette valeur pour ntree.
+
+
+```{r}
+# si m = p, random forest = bagging
+set.seed(2018)
+fit.bag = randomForest(label~., data = train.app, mtry = 4654, ntree = 18000)
+print(fit.bag)
+```
+
+Erreur test :
+```{r}
+set.seed(2018)
+pred = predict(fit.bag, newdata = train.test, type = "class")
+err.bag1 = mean(pred != train.test$label)
+cat("Erreur test :\n")
+err.bag1
+```
+
+La methode bagging est legerement meilleure que le random forest.
+
+Importance des variables :
+```{r}
+set.seed(2018)
+fit.rf.imp = randomForest(label~., data = train.app, ntree = 12000, mtry = 68, importance = TRUE)
+varImpPlot(fit.rf.imp)
+```
+
+Il est difficile d'interpreter ces donnees. En effet, on ne sait pas quel est le seuil de significativite. Pour cela, il faudrait utiliser l'algorithme VSURF pour pouvoir poser ce seuil et envisager une selection de variables.
+
+
+
+------------------- Arbre CART -------------------
+
+
+On implemente la methode de l'arbre CART. On commence par faire varier minsplit et on cherche celui qui fournit l'arbre max minimisant l'erreur d'apprentissage.
+```{r}
+set.seed(2018)
+library(rpart)
+library(rpart.plot)
+
+ms <- c(1,5,10,15,20,25,30,35,40,50)
+err.cart <- c()
+
+for (i in 1:length(ms))
+{
+  set.seed(2018)
+  tmax = rpart(label~., data = train.app, method="class", xval=10, control = rpart.control(minsplit = ms[i] , cp = 0))
+  pred <- predict(tmax, newdata = train.app, type = "class")
+  err.cart[i] <-mean(train.app$label != pred)
+  }
+plot(ms, err.cart, ylab = "erreur apprentissage", xlab = "minsplit", main = "Representation de l'erreur d'apprentissage en fonction de minsplit", col = 2)
+best_ms <- ms[which.min(err.cart)]
+```
+
+
+```{r}
+set.seed(2018)
+tmax2 = rpart(label~., data = train.app, method="class", xval=10, control = rpart.control(minsplit = best_ms, cp = 0))
+print(tmax2)
+rpart.plot(tmax2)
+
+# Etape d'elagage
+plotcp(tmax2)
+```
+
+Pour l'elagage, on prend le cp qui minimise l'erreur d'apprentissage graphiquement (car sinon on obtient un arbre elage jusqu'a la racine) :
+```{r}
+tprune1 <- prune(tmax2, 0.058)
+plot(tprune1)
+text(tprune1, cex = 0.8)
+```
+
+
+Calcul de l'erreur test sur l'arbre complet :
+```{r}
+pred <- predict(tmax2, newdata = train.test, type = "class")
+err.cart1 = mean(train.test$label != pred)
+cat("Erreur test :\n")
+err.cart1
+```
+
+
+Calcul de l'erreur test sur l'arbre elage :
+```{r}
+pred <- predict(tprune1, newdata = train.test, type = "class")
+err.cart.elag1 = mean(train.test$label != pred)
+cat("Erreur test :\n")
+err.cart.elag1
+```
+
+L'arbre elage donne une erreur test legerement meilleure que l'arbre complet mais qui est quand meme mauvaise.
+
+
+------------------- SVM -------------------
+
+ Noyau lineaire :
+ 
+```{r}
+library(e1071)
+set.seed(2018)
+fit.linear = svm(label~., data = train.app, kernel = "linear")
+summary(fit.linear)
+```
+
+Dans le cas d'un noyau lineaire, le cout est le seul parametre (d'apres le site listen data)
+```{r}
+set.seed(2018)
+tune.linear = tune(svm, label~., data = train.app,  kernel = "linear", ranges = list(cost = c(0.001,0.1,10)), tunecontrol = tune.control(cross = 5))
+summary(tune.linear)
+tune.linear$best.parameters
+```
+
+L'erreur calculee par cette methode reste la meme quelque soit le cout. Cependant, lorsque l'on diminue drastiquement ce parametre (10^-7), l'erreur baisse mais la prediction fournit est tres mauvaise (toutes les predictions sont a "no").
+
+on effectue les predictions :
+```{r}
+table(true = train.test$label, pred = predict(tune.linear$best.model, newdata = train.test))
+err.svm.linear1 = mean(train.test$label != predict(tune.linear$best.model, newdata = train.test))
+cat("\nerreur test :\n")
+err.svm.linear1
+```
+
+
+
+ Noyau radial :
+ 
+```{r}
+set.seed(2018)
+fit.radial = svm(label~., data = train.app,  kernel = "radial")
+summary(fit.radial)
+```
+
+
+```{r}
+set.seed(2018)
+tune.radial = tune(svm, label~., data = train.app,  kernel = "radial", ranges = list(cost = c(0.001,0.1,1), gamma = c(0.001, 0.1)), tunecontrol = tune.control(cross = 5))
+summary(tune.radial)
+tune.radial$best.parameters
+```
+
+L'erreur calculee est toujours la meme, quelque soit le couple cout-gamma.
+
+
+on effectue les predictions :
+```{r}
+table(true = train.test$label, pred = predict(tune.radial$best.model, newdata = train.test))
+err.svm.radial1 = mean(train.test$label != predict(tune.radial$best.model, newdata = train.test))
+cat("\nerreur test :\n")
+err.svm.radial1
+```
+
+La matrice de confusion est tres mauvaise : on obtient beaucoup de faux negatifs et aucun vrais positifs : tout est predit comme non rechute. Ceci est une tres mauvaise prediction du point de vue medical. En effet, on prefererait avoir plus de faux positifs que de faux negatifs (car cela veut dire que, dans notre cas, on ne diagnostique pas de rechute meme quand il y en a une).
+On peut emettre l'hypothese que cette prediction est du au fait que les donnees contiennent plus de cas de non rechute que de rechute.
+
+
+ Noyau polynomial :
+
+```{r}
+set.seed(2018) 
+fit.poly = svm(label~., data = train.app,  kernel = "polynomial")
+summary(fit.poly)
+```
+
+
+```{r}
+set.seed(2018)
+tune.poly = tune(svm, label~., data = train.app,  kernel = "polynomial", ranges = list(cost = c(0.001,0.1,1), degree = c(1,2,3,4,5), gamma = c(0.001,0.1,1)), tunecontrol = tune.control(cross = 5))
+summary(tune.poly)
+tune.poly$best.parameters
+```
+
+on effectue les predictions :
+```{r}
+table(true = train.test$label, pred = predict(tune.poly$best.model, newdata = train.test))
+err.svm.pol1 = mean(train.test$label != predict(tune.poly$best.model, newdata = train.test))
+cat("\nerreur test :\n")
+err.svm.pol1
+```
+
+La matrice de confusion est un peu meilleure que la precedente (tout n'est pas predit comme "No"). Cependant, l'erreur test est encore plus mauvaise car on augmente le taux de faux positifs.
+
+
+ Noyau sigmoide :
+
+```{r}
+set.seed(2018) 
+fit.sig = svm(label~., data = train.app,  kernel = "sigmoid")
+summary(fit.poly)
+```
+
+
+```{r}
+set.seed(2018)
+tune.sig = tune(svm, label~., data = train.app,  kernel = "sigmoid", ranges = list(cost = c(0.001,0.1,1), gamma = c(0.001,0.1,1)), tunecontrol = tune.control(cross = 5))
+summary(tune.sig)
+tune.sig$best.parameters
+```
+
+Comme pour le noyau radial,  quelque soit le couple cout - gamma, l'erreur calculee reste la meme.
+
+on effectue les predictions :
+```{r}
+table(true = train.test$label, pred = predict(tune.sig$best.model, newdata = train.test))
+err.svm.sig1 = mean(train.test$label != predict(tune.sig$best.model, newdata = train.test))
+cat("\nerreur test :\n")
+err.svm.sig1
+```
+
+On obtient les memes resultats que pour le noyau radial et donc les memes conclusions.
+
+
+
+############################################
+  Selection des covariables avec lambda min
+############################################
+
+On implemente les methodes de classification avec les covariables selectionnees a l'aide de la methode LASSO pour un lambda min (stockees dans le vecteur beta). On decide egalement d'implementer les methodes qui n'ont pas besoin de selection de variables (telles que random forest, CART ou SVM) afin de voir si la prediction s'ameliore.
+
+
+------------------- Regression logistique multiple -------------------
+
+On ajuste la regression logistique :
+```{r}
+# On recupere le nom des covariables selectionnees dans un vecteur appele name
+name = c()
+for (i in 1:length((beta[,])))
+{
+  name <- c(name,names(train)[beta[i,1]])
+}
+
+# On code la formule qui sera utilisee pour l'implementation des methodes
+(formule <- as.formula(paste("label ~ ", paste(name, collapse= "+"))))
+
+
+# Ajustement de la regression logistique
+fit.glm <- glm(formule, data = train.app, family = "binomial")
+summary(fit.glm)
+```
+
+La regression logistique indique que seulement 2 covariables sont significatives au seuil 5%.
+On pourra essayer par la suite de refaire une regression logistique uniquement avec ces 2 covariables.
+
+Pour definir le seuil, on cherche le point sur la courbe ROC le plus proche de (0,1) car c'est le point ou le classificateur n'a aucun faux positif ni aucun faux négatif, et ne se trompe donc jamais.
+```{r}
+#On cree une fonction qui calcul la distance au point ideal (0,1)
+# avec abs l'abscisse du point et ord son ordonnee
+dist1 <- function(abs, ord)
+{
+  return(sqrt((abs-0)^2+(ord-1)^2))
+}
+
+#prediction de la regression logistique
+proba <- predict(fit.glm, newdata = train.test, type = "response")
+
+# seuil s
+s = seq(0,1, .001)
+
+# Initialisation
+absc_log = numeric(length(s))
+ordo_log = numeric(length(s))
+
+# Initialisation de la distance minimale a une valeur tres grande
+min_dist = 10000
+a = 0               # abscisse
+o = 0               # ordonnee
+
+# courbe ROC : taux de VP en fonction du taux de FP
+for (i in 1:length(s))
+{
+  ordo_log[i] = sum (proba >= s[i] & train.test$label == "yes")/sum(train.test$label == "yes")
+  absc_log[i] = sum (proba >= s[i] & train.test$label == "no")/sum(train.test$label == "no")
+  
+  d = dist1(absc_log[i],ordo_log[i])
+  
+  if (d < min_dist && d != 0)
+  {
+    a <- absc_log[i]
+    o <- ordo_log[i]
+    min_dist <- d
+    seuil <- s[i]
+  }
+}
+
+cat("Seuil :\n")
+seuil
+
+plot(absc_log, ordo_log, type = "l", xlab = "FP", ylab = "VP", main = "Courbe ROC de la regression logistique")
+lines(s,s, col = "red")
+points(a, o, col = "red", cex = 1.4, pch = 19)
+```
+
+La courbe ROC ne donne pas de bons resultats. En effet, celle-ci est tres proche de la 1ere bissectrice et donc des resultats obtenus par hasard.
+
+
+On calcule la probabilite de rechute (grace a la fonction predict).
+Ensuite, on code un vecteur qui prend la valeur "yes" ou "no" en fonction de la probabilite (si on est inferieur au seuil trouve a l'aide de la courbe ROC, alors la patiente est classee comme ne faisant pas de rechute).
+Enfin, on calcule l'erreur test en calculant le taux de mal classes.
+
+```{r}
+pred.glm <- rep("no", length(train.test$label))
+pred.glm[proba>seuil] = "yes"
+err.glm1 = mean(train.test$label != pred.glm)
+cat("Erreur test :\n")
+err.glm1
+```
+
+
+On effectue maintenant la regression logistique avec uniquement les 2 covariables significatives :
+```{r}
+# Ajustement de la regression logistique
+fit.glmbis = glm(label ~ x2954_at + x3128_at, data = train.app, family = "binomial")
+summary(fit.glmbis)
+
+```
+
+```{r}
+probabis <- predict(fit.glmbis, newdata = train.test, type = "response")
+
+# seuil s
+s = seq(0,1, .001)
+
+# Initialisation
+absc_log = numeric(length(s))
+ordo_log = numeric(length(s))
+
+min_dist = 10000
+a = 0
+o = 0
+
+# courbe ROC : taux de VP en fonction du taux de FP
+for (i in 1:length(s))
+{
+  ordo_log[i] = sum (probabis >= s[i] & train.test$label == "yes")/sum(train.test$label == "yes")
+  absc_log[i] = sum (probabis >= s[i] & train.test$label == "no")/sum(train.test$label == "no")
+  
+  d = dist1(absc_log[i],ordo_log[i])
+  
+  if (d < min_dist && d != 0)
+  {
+    a <- absc_log[i]
+    o <- ordo_log[i]
+    min_dist <- d
+    seuil <- s[i]
+  }
+}
+
+cat("Seuil :\n")
+seuil
+
+plot(absc_log, ordo_log, type = "l", xlab = "FP", ylab = "VP", main = "Courbe ROC pour la nouvelle regression a 2 covariables")
+lines(s,s, col = "red")
+points(a, o, col = "red", cex = 1.4, pch = 19)
+```
+
+La courbe ROC semble meilleure que la precedente (elle s'eloigne de la 1ere bissectrice pour se rapprocher du point (0,1)).
+
+On calcule l'erreur test en calculant le taux de mal classes.
+```{r}
+pred.glm <- rep("no", length(train.test$label))
+pred.glm[probabis>seuil] = "yes"
+err.glm1bis = mean(train.test$label != pred.glm)
+cat("Erreur test :\n")
+err.glm1bis
+```
+
+On obtient une erreur test bien meilleure que lors de la regression precedente. Cependant, garder uniquement 2 covariables alors que l'on n'en avait 4654 a la base est peut-etre trop peu. Il faudrait voir si ces genes sont connus pour etre impliques dans le risque de rechute de cancer du sein et si d'autres ne le sont pas egalement. De plus, peut-etre que ces genes sont correles a d'autres qui sont en fait les veritables genes impliques.
+Il est statistiquement possible mais risque de ne baser la prediction que sur 2 covariables. On ne retient donc pas cette methode pour la prediction finale.
+
+
+------------------- Random Forest -------------------
+
+On ajuste la regression a l'aide de la methode de forets aleatoires. On cherche le couple de parametres mtry et ntree qui minimise l'erreur test :
+```{r}
+set.seed(1)
+library(randomForest)
+
+# On cherche le nombre d'arbres ntree qui minimise l'erreur OOB, avec mtry a sa valeur par defaut
+fit.rf2 = randomForest(formule, data = train.app, ntree = 8000)
+summary(fit.rf2)
+plot(fit.rf2$err.rate[, 1], type = "l", xlab = "nombre d'arbres", ylab = "erreur OOB")
+
+cat("\nmtry par defaut :\n")
+fit.rf2$mtry
+```
+
+On voit que l'OOB se stabilise a peu pres a partir de 3500 arbres : on choisit donc cette valeur pour ntree.
+
+On cherche maintenant a optimiser le mtry. On essaye avec avec la valeur par defaut qui est 4, la moitie de cette valeur est son double (d'apres le site listen data) :
+```{r}
+set.seed(2018)
+print(randomForest(formule, data = train.app, ntree = 3500, mtry = 4))
+set.seed(2018)
+print(randomForest(formule, data = train.app, ntree = 3500, mtry = 2))
+set.seed(2018)
+print(randomForest(formule, data = train.app, ntree = 3500, mtry = 8))
+```
+
+=> On obtient la meme erreur OOB pour mtry = 4 et 2 ainsi que la meme matrice de confusion. On choisit donc de garder le mtry par defaut.
+
+
+Erreur test :
+```{r}
+set.seed(2018)
+fit.rf2 <- randomForest(formule, data = train.app, ntree = 3500, mtry = 4)
+pred = predict(fit.rf2, newdata = train.test, type = "class")
+err.rf2 = mean(pred != train.test$label)
+cat("Erreur test:\n")
+err.rf2
+```
+
+
+------------------- Methode bagging : -------------------
+
+On cherche le nombre d'arbres ntree qui minimise l'erreur OOB, avec mtry = 4654 (bagging)
+```{r}
+set.seed(2018)
+fit.bag2 = randomForest(formule, data = train.app, mtry = 4654, ntree = 40000)
+plot(fit.bag2$err.rate[, 1], type = "l", xlab = "nombre d'arbres", ylab = "erreur OOB")
+```
+
+On voit que l'OOB se stabilise a peut pres a partir de 30000 arbres : on choisit donc cette valeur pour ntree.
+
+
+```{r}
+# si m = p, random forest = bagging
+set.seed(2018)
+fit.bag2 = randomForest(formule, data = train.app, mtry = 4654, ntree = 30000)
+print(fit.bag2)
+```
+
+Erreur test :
+```{r}
+set.seed(2018)
+pred = predict(fit.bag2, newdata = train.test, type = "class")
+err.bag2 = mean(pred != train.test$label)
+cat("Erreur test :\n")
+err.bag2
+```
+
+La methode bagging est legerement meilleure que le random forest.
+
+
+------------------- Arbre CART -------------------
+
+On implemente la methode de l'arbre CART. On commence par faire varier minsplit et on cherche celui qui fournit l'arbre max minimisant l'erreur d'apprentissage.
+```{r}
+set.seed(2018)
+library(rpart)
+library(rpart.plot)
+
+ms <- c(1,5,10,15,20,25,30,35,40,50)
+err.cart <- c()
+
+for (i in 1:length(ms))
+{
+  set.seed(2018)
+  tmax3 = rpart(formule, data = train.app, method="class", xval=10, control = rpart.control(minsplit = ms[i] , cp = 0))
+  pred <- predict(tmax3, newdata = train.app, type = "class")
+  err.cart[i] <-mean(train.app$label != pred)
+  }
+plot(ms, err.cart, ylab = "erreur apprentissage", xlab = "minsplit", main = "Representation de l'erreur d'apprentissage en fonction de minsplit", col = 2)
+best_ms <- ms[which.min(err.cart)]    # meilleure minsplit
+```
+
+
+```{r}
+set.seed(2018)
+tmax4 = rpart(formule, data = train.app, method="class", xval=10, control = rpart.control(minsplit = best_ms, cp = 0))
+print(tmax4)
+rpart.plot(tmax4)
+
+# Etape d'elagage
+plotcp(tmax4)
+```
+
+Pour l'elagage, on prend le cp qui minimise l'erreur d'apprentissage graphiquement (car sinon on obtient un arbre elage jusqu'a la racine) :
+```{r}
+tprune2 <- prune(tmax4, 0.058)
+plot(tprune2)
+text(tprune2, cex = 0.8)
+```
+
+
+Calcul de l'erreur test sur l'arbre complet :
+```{r}
+pred <- predict(tmax4, newdata = train.test, type = "class")
+err.cart2 = mean(train.test$label != pred)
+cat("Erreur test :\n")
+err.cart2
+```
+
+
+Calcul de l'erreur test sur l'arbre elage :
+```{r}
+pred <- predict(tprune2, newdata = train.test, type = "class")
+err.cart.elag2 = mean(train.test$label != pred)
+cat("Erreur test :\n")
+err.cart.elag2
+```
+
+L'arbre elage donne une erreur test meilleure que l'arbre complet.
+
+
+
+------------------- SVM -------------------
+
+ Noyau lineaire :
+ 
+```{r}
+library(e1071)
+set.seed(2018)
+fit.linear = svm(formule, data = train.app, kernel = "linear")
+summary(fit.linear)
+```
+
+
+```{r}
+set.seed(2018)
+tune.linear = tune(svm, formule, data = train.app,  kernel = "linear", ranges = list(cost = c(0.001,0.1,10)), tunecontrol = tune.control(cross = 5))
+summary(tune.linear)
+tune.linear$best.parameters
+```
+
+on effectue les predictions :
+```{r}
+table(true = train.test$label, pred = predict(tune.linear$best.model, newdata = train.test))
+err.svm.linear2 = mean(train.test$label != predict(tune.linear$best.model, newdata = train.test))
+cat("erreur test :\n")
+err.svm.linear2
+```
+
+La matrice de confusion est tres mauvaise : on obtient beaucoup de faux negatifs et aucun vrais positifs : tout est predit comme non rechute. Ceci est une tres mauvaise prediction du point de vue medical. En effet, on prefererait avoir plus de faux positifs que de faux negatifs (car cela veut dire que, dans notre cas, on ne diagnostique pas de rechute meme quand il y en a une).
+On peut emettre l'hypothese que cette prediction est du au fait que les donnees contiennent plus de cas de non rechute que de rechute.
+
+
+ Noyau radial :
+ 
+```{r}
+set.seed(2018)
+fit.radial = svm(formule, data = train.app,  kernel = "radial")
+summary(fit.radial)
+```
+
+
+```{r}
+set.seed(2018)
+tune.radial = tune(svm, formule, data = train.app,  kernel = "radial", ranges = list(cost = c(0.001,0.1,1), gamma = c(0.001, 0.1)), tunecontrol = tune.control(cross = 5))
+summary(tune.radial)
+tune.radial$best.parameters
+```
+
+on effectue les predictions :
+```{r}
+table(true = train.test$label, pred = predict(tune.radial$best.model, newdata = train.test))
+err.svm.radial2 = mean(train.test$label != predict(tune.radial$best.model, newdata = train.test))
+cat("\nerreur test :\n")
+err.svm.radial2
+```
+
+Meme resultats et conclusions que le noyau lineaire.
+
+
+ Noyau polynomial :
+
+```{r}
+set.seed(2018) 
+fit.poly = svm(formule, data = train.app,  kernel = "polynomial")
+summary(fit.poly)
+```
+
+
+```{r}
+set.seed(2018)
+tune.poly = tune(svm, formule, data = train.app,  kernel = "polynomial", ranges = list(cost = c(0.001,0.1,1), degree = c(1,2,3,4,5), gamma = c(0.001,0.1,1)), tunecontrol = tune.control(cross = 5))
+summary(tune.poly)
+tune.poly$best.parameters
+```
+
+on effectue les predictions :
+```{r}
+table(true = train.test$label, pred = predict(tune.poly$best.model, newdata = train.test))
+err.svm.pol2 = mean(train.test$label != predict(tune.poly$best.model, newdata = train.test))
+cat("\nErreur test :\n")
+err.svm.pol2
+```
+
+La matrice de confusion est un peu meilleure que la precedente (tout n'est pas predit comme "No"). Cependant, l'erreur test est encore plus mauvaise. On peut donc supposer que la repartition dans les classes est mauavaise.
+
+
+ Noyau sigmoide :
+ 
+```{r}
+set.seed(2018) 
+fit.sig = svm(formule, data = train.app,  kernel = "sigmoid")
+summary(fit.poly)
+```
+
+
+```{r}
+set.seed(2018)
+tune.sig = tune(svm, formule, data = train.app,  kernel = "sigmoid", ranges = list(cost = c(0.001,0.1,1,10), gamma = c(0.001,0.1,1,10,20)), tunecontrol = tune.control(cross = 5))
+summary(tune.sig)
+tune.sig$best.parameters
+```
+
+
+On effectue les predictions :
+```{r}
+table(true = train.test$label, pred = predict(tune.sig$best.model, newdata = train.test))
+err.svm.sig2 = mean(train.test$label != predict(tune.sig$best.model, newdata = train.test))
+cat("\n\nErreur test :\n")
+err.svm.sig2
+```
+
+Tout n'est pas predit comme "No". On augmente cependant le taux de faux positifs : l'erreur test est donc encore plus mauvaise.
+
+
+
+############################################
+    Seconde selection des covariables
+############################################
+
+On implemente les methodes de regression avec les covariables selectionnees a l'aide de la methode LASSO pour un lambda plus grand que precedemment (stockees dans le vecteur beta2). De la meme maniere que pour la selection de covariables precedente, on implemente egalement les methodes qui n'ont pas besoin de selection de variables.
+
+------------------- Regression logistique multiple -------------------
+
+On ajuste la regression logistique :
+```{r}
+
+# On recupere le nom des covariables selectionnees dans un vecteur appele name
+name2 = c()
+for (i in 1:length((beta2[,])))
+{
+  name2 <- c(name2,names(train)[beta2[i,1]])
+}
+
+#label <- train.app$label
+
+# On code la formule qui sera utilisee pour l'implementation des methodes
+(formule2 <- as.formula(paste("label ~ ", paste(name2, collapse= "+"))))
+
+
+# Ajustement de la regression logistique
+fit.glm2 <- glm(formule2, data = train.app, family = "binomial")
+summary(fit.glm2)
+```
+
+On obtient 12 covariables significatives au seuil 5% (dont une des deux que l'on avait deja sur la regression logistique precedente).
+
+
+Pour definir le seuil, on cherche le point sur la courbe ROC le plus proche de (0,1).
+```{r}
+proba2 <- predict(fit.glm2, newdata = train.test, type = "response")
+
+# seuil s
+s = seq(0,1, .001)
+
+# Initialisation
+absc_log2 = numeric(length(s))
+ordo_log2 = numeric(length(s))
+
+min_dist2 = 10000
+a2 = 0
+o2 = 0
+
+# courbe ROC : taux de VP en fonction du taux de FP
+for (i in 1:length(s))
+{
+  ordo_log2[i] = sum (proba2 >= s[i] & train.test$label == "yes")/sum(train.test$label == "yes")
+  absc_log2[i] = sum (proba2 >= s[i] & train.test$label == "no")/sum(train.test$label == "no")
+  
+  d = dist1(absc_log2[i],ordo_log2[i])
+  
+  if (d < min_dist2 && d != 0)
+  {
+    a2 <- absc_log2[i]
+    o2 <- ordo_log2[i]
+    min_dist2 <- d
+    seuil2 <- s[i]
+  }
+}
+
+cat("Seuil :\n")
+seuil2
+
+plot(absc_log2, ordo_log2, type = "l", xlab = "FP", ylab = "VP", main = "Courbe ROC avec la 2e selection de variables")
+lines(s,s, col = "red")
+points(a2, o2, col = "red", cex = 1.4, pch = 19)
+```
+
+La courbe ROC semble vraiment mauvaise (tres proche de la 1ere bissectrice).
+
+
+On calcule l'erreur test :
+```{r}
+proba <- predict(fit.glm2, newdata = train.test, type = "response")
+pred.glm <- rep("no", length(train.test$label))
+pred.glm[proba>seuil2] = "yes"
+err.glm2 = mean(train.test$label != pred.glm)
+cat("Erreur test :\n")
+err.glm2
+```
+
+On obtient une erreur test vraiment mauvaise.
+
+
+On effectue maintenant la regression logistique avec uniquement les 12 covariables significatives :
+```{r}
+# Ajustement de la regression logistique
+fit.glmbis2 = glm(label ~ x10252_at + x11118_at + x11321_at + x1349_at + x191_at + x2108_at + x23112_at + x25936_at + x2954_at + x3636_at + x5292_at + x79866_at, data = train.app, family = "binomial")
+summary(fit.glmbis2)
+```
+
+```{r}
+probabis2 <- predict(fit.glmbis2, newdata = train.test, type = "response")
+
+# seuil s
+s = seq(0,1, .001)
+
+# Initialisation
+absc_log = numeric(length(s))
+ordo_log = numeric(length(s))
+
+min_dist = 10000
+a = 0
+o = 0
+
+# courbe ROC : taux de VP en fonction du taux de FP
+for (i in 1:length(s))
+{
+  ordo_log[i] = sum (probabis2 >= s[i] & train.test$label == "yes")/sum(train.test$label == "yes")
+  absc_log[i] = sum (probabis2 >= s[i] & train.test$label == "no")/sum(train.test$label == "no")
+  
+  d = dist1(absc_log[i],ordo_log[i])
+  
+  if (d < min_dist && d != 0)
+  {
+    a <- absc_log[i]
+    o <- ordo_log[i]
+    min_dist <- d
+    seuil <- s[i]
+  }
+}
+
+cat("Seuil :\n")
+seuil
+
+plot(absc_log, ordo_log, type = "l", xlab = "FP", ylab = "VP", main = "Courbe ROC pour la nouvelle regression a 12 covariables")
+lines(s,s, col = "red")
+points(a, o, col = "red", cex = 1.4, pch = 19)
+```
+
+La courbe ROC reste tres proche de la 1ere bissetrice (et donc d'une prediction aleatoire).
+
+On calcule l'erreur test en calculant le taux de mal classes.
+```{r}
+pred.glm <- rep("no", length(train.test$label))
+pred.glm[probabis2>seuil] = "yes"
+err.glm1bis2 = mean(train.test$label != pred.glm)
+cat("Erreur test :\n")
+err.glm1bis2
+```
+
+On obtient une meilleure erreur test que pour la regression logistique precedente. Cependant, elle est tout de meme elevee.
+
+
+------------------- Random Forest -------------------
+
+On ajuste la regression a l'aide de la methode de forets aleatoires. On cherche le couple de parametres mtry et ntree qui minimise l'erreur test :
+```{r}
+set.seed(1)
+library(randomForest)
+
+# On cherche le nombre d'arbres ntree qui minimise l'erreur OOB, avec mtry a sa valeur par defaut
+fit.rf3 = randomForest(formule2, data = train.app, ntree = 15000)
+summary(fit.rf3)
+plot(fit.rf3$err.rate[, 1], type = "l", xlab = "nombre d'arbres", ylab = "erreur OOB")
+
+cat("\nmtry par defaut :\n")
+fit.rf3$mtry
+```
+
+On voit que l'OOB se stabilise a peu pres a partir de 14000 arbres : on choisit donc cette valeur pour ntree.
+
+
+On cherche maintenant a optimiser le mtry. On essaye avec avec la valeur par defaut qui est 6, la moitie de cette valeur est son double (d'apres le site listen data) :
+```{r}
+set.seed(2018)
+print(randomForest(formule2, data = train.app, ntree = 14000, mtry = 6))
+set.seed(2018)
+print(randomForest(formule2, data = train.app, ntree = 14000, mtry = 3))
+set.seed(2018)
+print(randomForest(formule2, data = train.app, ntree = 14000, mtry = 12))
+```
+
+On obtient la meme erreur OOB pour mtry = 6 et 12. Cependant on obtient plus de faux negatifs pour mtry = 6 et plus de faux positifs pour mtry = 12. On prefere predire a une patiente qu'elle a un cancer alors que ce n'est pas le cas plutot que l'inverse (avoir plus de faux positifs que de faux negatifs). On prefere donc prendre mtry = 12.
+
+
+Erreur test :
+```{r}
+set.seed(2018)
+fit.rf3 <- randomForest(formule2, data = train.app, ntree = 14000, mtry = 12)
+pred = predict(fit.rf3, newdata = train.test, type = "class")
+err.rf3 = mean(pred != train.test$label)
+cat("Erreur test:\n")
+err.rf3
+```
+
+
+----------- Methode bagging : -----------
+
+On cherche le nombre d'arbres ntree qui minimise l'erreur OOB, avec mtry = 4654 (bagging)
+```{r}
+set.seed(2018)
+fit.bag3 = randomForest(formule2, data = train.app, mtry = 4654, ntree = 50000)
+plot(fit.bag3$err.rate[, 1], type = "l", xlab = "nombre d'arbres", ylab = "erreur OOB")
+```
+
+On voit que l'OOB se stabilise a peut pres a partir de 30000 arbres : on choisit donc cette valeur pour ntree.
+
+
+```{r}
+# si m = p, random forest = bagging
+set.seed(2018)
+fit.bag3 = randomForest(formule2, data = train.app, mtry = 4654, ntree = 30000)
+print(fit.bag3)
+```
+
+Erreur test :
+```{r}
+set.seed(2018)
+pred = predict(fit.bag3, newdata = train.test, type = "class")
+err.bag3 = mean(pred != train.test$label)
+cat("Erreur test :\n")
+err.bag3
+```
+
+La methode bagging est moins bonne que le random forest.
+
+
+
+------------------- Arbre CART -------------------
+
+On implemente la methode de l'arbre CART. On commence par faire varier minsplit et on cherche celui qui fournit l'arbre max minimisant l'erreur d'apprentissage.
+```{r}
+set.seed(2018)
+library(rpart)
+library(rpart.plot)
+
+ms <- c(1,5,10,15,20,25,30,35,40,50)
+err.cart <- c()
+
+for (i in 1:length(ms))
+{
+  set.seed(2018)
+  tmax5 = rpart(formule2, data = train.app, method="class", xval=10, control = rpart.control(minsplit = ms[i] , cp = 0))
+  pred <- predict(tmax5, newdata = train.app, type = "class")
+  err.cart[i] <-mean(train.app$label != pred)
+  }
+plot(ms, err.cart, ylab = "erreur apprentissage", xlab = "minsplit", main = "Representation de l'erreur d'apprentissage en fonction de minsplit", col = 2)
+best_ms <- ms[which.min(err.cart)]
+```
+
+
+```{r}
+set.seed(2018)
+tmax6 = rpart(formule2, data = train.app, method="class", xval=10, control = rpart.control(minsplit = best_ms, cp = 0))
+print(tmax6)
+rpart.plot(tmax6)
+
+# Etape d'elagage
+plotcp(tmax6)
+```
+
+Pour l'elagage, on prend le cp qui minimise l'erreur d'apprentissage graphiquement (car sinon on obtient un arbre elage jusqu'a la racine) :
+```{r}
+tprune3 <- prune(tmax4, 0.095)
+plot(tprune3)
+text(tprune3, cex = 0.8)
+```
+
+
+Calcul de l'erreur test sur l'arbre complet :
+```{r}
+pred <- predict(tmax6, newdata = train.test, type = "class")
+err.cart3 = mean(train.test$label != pred)
+cat("Erreur test :\n")
+err.cart3
+```
+
+
+Calcul de l'erreur test sur l'arbre elage :
+```{r}
+pred <- predict(tprune3, newdata = train.test, type = "class")
+err.cart.elag3 = mean(train.test$label != pred)
+cat("Erreur test :\n")
+err.cart.elag3
+```
+
+L'arbre elage donne une erreur test meilleure que l'arbre complet.
+
+
+
+
+------------------- SVM -------------------
+
+ Noyau lineaire :
+ 
+```{r}
+library(e1071)
+set.seed(2018)
+fit.linear = svm(formule2, data = train.app, kernel = "linear")
+summary(fit.linear)
+```
+
+
+```{r}
+set.seed(2018)
+tune.linear = tune(svm, formule2, data = train.app,  kernel = "linear", ranges = list(cost = c(0.001,0.1,10)), tunecontrol = tune.control(cross = 5))
+summary(tune.linear)
+tune.linear$best.parameters
+```
+
+on effectue les predictions :
+```{r}
+table(true = train.test$label, pred = predict(tune.linear$best.model, newdata = train.test))
+err.svm.linear3 = mean(train.test$label != predict(tune.linear$best.model, newdata = train.test))
+cat("\nerreur test :\n")
+err.svm.linear3
+```
+
+La matrice de confusion est tres mauvaise : on obtient beaucoup de faux negatifs et aucun vrais positifs : tout est predit comme non rechute. Ceci est une tres mauvaise prediction du point de vue medical. En effet, on prefererait avoir plus de faux positifs que de faux negatifs (car cela veut dire que, dans notre cas, on ne diagnostique pas de rechute meme quand il y en a une).
+On peut emettre l'hypothese que cette prediction est du au fait que les donnees contiennent plus de cas de non rechute que de rechute.
+
+ Noyau radial :
+ 
+```{r}
+set.seed(2018)
+fit.radial = svm(formule2, data = train.app,  kernel = "radial")
+summary(fit.radial)
+```
+
+
+```{r}
+set.seed(2018)
+tune.radial = tune(svm, formule2, data = train.app,  kernel = "radial", ranges = list(cost = c(0.001,0.1,1), gamma = c(0.001, 0.1)), tunecontrol = tune.control(cross = 5))
+summary(tune.radial)
+tune.radial$best.parameters
+```
+
+on effectue les predictions :
+```{r}
+table(true = train.test$label, pred = predict(tune.radial$best.model, newdata = train.test))
+err.svm.radial3 = mean(train.test$label != predict(tune.radial$best.model, newdata = train.test))
+cat("\nerreur test :\n")
+err.svm.radial3
+```
+
+Meme resultats et meme conclusion que pour le noyau lineaire.
+
+
+ Noyau polynomial :
+
+```{r}
+set.seed(2018) 
+fit.poly = svm(formule2, data = train.app,  kernel = "polynomial")
+summary(fit.poly)
+```
+
+
+```{r}
+set.seed(2018)
+tune.poly = tune(svm, formule2, data = train.app,  kernel = "polynomial", ranges = list(cost = c(0.001,0.1,1), degree = c(1,2,3,4,5), gamma = c(0.001,0.1,1)), tunecontrol = tune.control(cross = 5))
+summary(tune.poly)
+tune.poly$best.parameters
+```
+
+on effectue les predictions :
+```{r}
+table(true = train.test$label, pred = predict(tune.poly$best.model, newdata = train.test))
+err.svm.pol3 = mean(train.test$label != predict(tune.poly$best.model, newdata = train.test))
+cat("\nerreur test :\n")
+err.svm.pol3
+```
+
+Tout n'est pas predit comme "No". On a cependant augmente le taux de faux positifs : l'erreur test est donc encore plus mauvaise.
+
+
+ Noyau sigmoide :
+ 
+```{r}
+set.seed(2018) 
+fit.sig = svm(formule2, data = train.app,  kernel = "sigmoid")
+summary(fit.poly)
+```
+
+
+```{r}
+set.seed(2018)
+tune.sig = tune(svm, formule2, data = train.app,  kernel = "sigmoid", ranges = list(cost = c(0.001,0.1,1,10), gamma = c(0.001,0.1,1,10,20)), tunecontrol = tune.control(cross = 5))
+summary(tune.sig)
+tune.sig$best.parameters
+```
+
+on effectue les predictions :
+```{r}
+table(true = train.test$label, pred = predict(tune.sig$best.model, newdata = train.test))
+err.svm.sig3 = mean(train.test$label != predict(tune.sig$best.model, newdata = train.test))
+cat("\nerreur test :\n")
+err.svm.sig3
+```
+
+La matrice de confusion est un peu meilleure que la precedente (tout n'est pas predit comme "No"). Cependant, l'erreur test est encore plus mauvaise car on augmente le taux de faux positifs.
+
+
+
+############################################
+              Aleatoire
+############################################
+
+
+```{r}
+set.seed(1)
+alea <- sample(c("no","yes"), length(train.test[,1]), replace = TRUE)
+err.alea = mean(train.test$label != alea)
+err.alea
+```
+
+On trouve une erreur test qui n'est pas tant eloignee que ca de celles trouvees avec les vraies methodes de machine learning. On peut donc penser que le jeu de donnees est tres bruite, ce qui est probablement du au fait qu'on est dans un contexte de grande dimension.
+
+
+
+############################################
+        Comparaison des methodes
+############################################
+
+On reaffiche toutes les erreurs tests calculees afin de comparer les methodes :
+
+```{r}
+cat(" ------------- Erreurs tests sans selection de variables : ------------- \nErreur test random forest :\n")
+err.rf1
+cat("\nErreur test bagging :\n")
+err.bag1
+cat("\nErreur test CART sur l'arbre complet :\n")
+err.cart1
+cat("\nErreur test CART sur l'arbre elage :\n")
+err.cart.elag1
+cat("\nErreur test SVM a noyau lineaire :\n")
+err.svm.linear1
+cat("\nErreur test SVM a noyau radial :\n")
+err.svm.radial1
+cat("\nErreur test SVM a noyau polynomial :\n")
+err.svm.pol1
+cat("\nErreur test SVM a noyau sigmoide :\n")
+err.svm.sig1
+
+cat("\n\n ------------- Erreurs tests avec selection de variables par LASSO pour lambda min : -------------\nErreur test de la regression LASSO :\n")
+err.lasso
+cat("\nErreur test de la regression logistique :\n")
+err.glm1
+cat("\nErreur test random forest :\n")
+err.rf2
+cat("\nErreur test bagging :\n")
+err.bag2
+cat("\nErreur test CART :\n")
+err.cart2
+cat("\nErreur test CART sur l'arbre elage :\n")
+err.cart.elag2
+cat("\nErreur test SVM a noyau lineaire :\n")
+err.svm.linear2
+cat("\nErreur test SVM a noyau radial :\n")
+err.svm.radial2
+cat("\nErreur test SVM a noyau polynomial :\n")
+err.svm.pol2
+cat("\nErreur test SVM a noyau sigmoide :\n")
+err.svm.sig2
+
+cat("\n\n ------------- Erreurs tests avec selection de variables par LASSO pour un lambda moins eleve : ------------- \nErreur test de la regression logistique :\n")
+err.glm2
+cat("\nErreur test de la regression logistique avec 12 covariables :\n")
+err.glm1bis2
+cat("\nErreur test random forest :\n")
+err.rf3
+cat("\nErreur test bagging :\n")
+err.bag3
+cat("\nErreur test CART :\n")
+err.cart3
+cat("\nErreur test SVM a noyau lineaire :\n")
+err.svm.linear3
+cat("\nErreur test SVM a noyau radial :\n")
+err.svm.radial3
+cat("\nErreur test SVM a noyau polynomial :\n")
+err.svm.pol3
+cat("\nErreur test SVM a noyau sigmoide :\n")
+err.svm.sig3
+
+cat("\nErreur test pour un vecteur de prediction aleatoire :\n")
+err.alea
+```
+
+CONCLUSION :
+
+De nombreuses methodes ont ete implementees pour permettre la prediction de rechute ou non des patientes pour des cas de cancer du sein.
+Sans selection de variables, la prediction est tres mauvaise quelque soit la methode. En effet, on obtient une erreur test systematiquement superieure a 0.38 (et jusqu'a 0.48 avec CART).
+Avec selection de covariables par la methode LASSO pour lambda min, les resultats sont globalement meilleurs : on obtient une erreur test de 0.35 avec les methodes bagging et CART sur l'arbre elage.
+Avec selection de covaribles par la methode LASSO pour un lambda moins eleve (selectionnant donc plus de covariables), les resultats sont sensiblement les memes, sauf pour la regression lineaire qui devient moins bonne.
+On peut noter que les resultats fournis par la methode SVM restent sensiblement les memes quelque soit la selection de variables. Ceci est logique puisque cette methode est prevue pour analyser des donnnees de grande dimension. Neanmoins, ceux-ci sont plutot mauvais puisque la meilleure erreur test obtenue est de 0.38 (a plusieurs reprises). De plus, le classement est souvent compose de beaucoup de faux negatifs. Malgre l'absence de faux postifs, ceci donne donc une mauvaise prediction qui est d'autant plus grave qu'il s'agit de predire la rechute de cancer du sein. Ainsi, avec cette methode, on a tendance a ne pas predire une rechute alors qu'il y en a une. On peut envisager que cela soit du au fait que l'on ait beaucoup de cas de non rechute dans les donnees, qui sont d'ailleurs peu nombreuses (pas assez d'individus). En outre, il se peut que les parametres choisis ne soient pas optimaux.
+Il est egalement possible qu'il y ait un biais d'echantillonnage. En effet, le jeu de donnees n'a ete decoupe qu'une seule fois en sous-jeu de donnees d'apprentissage et test. Il aurait ete preferable de faire une cross validation ou de realiser differents decoupages afin de moyenner les erreurs et ainsi reduire le biais.
+Etant donne le peu d'individus du jeu de donnees, il aurait ete envisageable d'effectuer un sur-echantillonnage afin d'ameliorer les resultats.
+
+La meilleure erreur test est finalement obtenue pour la random forest avec selection de variables par LASSO pour une valeur de lambda moins elevee (selectionnant 44 covariables). C'est donc cette methode que l'on va utiliser pour predire la variable reponse (rechute ou non) a partir du fichier xtest.
+
+
+```{r}
+# On reconvertit la variable reponse comme code initialement (-1 ou 1)
+train$label <- factor(unlist(train$label), labels = c(-1, 1))
+label <- train$label
+
+set.seed(2018)
+fit.final <- randomForest(formule2, data = train, ntree = 14000, mtry = 12)
+print(fit.final)
+pred = as.data.frame(predict(fit.final, newdata = test, type = "class"))
+table(pred)
+cat("\nPourcentage de rechutes dans les donnees test :\n")
+(25/(67+25))*100
+
+# Fichier avec les predictions
+write.table(pred, "ytest.txt", row.names = FALSE, col.names = FALSE, quote = FALSE)
+
+# Fichier avec la proba de rechute
+pred2 = as.data.frame(predict(fit.final, newdata = test, type = "prob"))
+proba = pred2$`1`
+write.table(proba, "prob_test.txt", row.names = FALSE, col.names = FALSE, quote = FALSE)
+```
+
+On peut noter que l'on predit 25 rechutes et 67 non rechutes, soit 27% de rechutes.
